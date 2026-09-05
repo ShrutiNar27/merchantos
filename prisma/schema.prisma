@@ -1,0 +1,248 @@
+// MerchantOS data model
+// SQLite for zero-config local/demo use. Swap `provider` to "postgresql"
+// and point DATABASE_URL at a real Postgres instance for production —
+// the schema uses only cross-compatible types.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Merchant & Policy
+// ---------------------------------------------------------------------------
+
+model Merchant {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  policy PolicyConfig?
+}
+
+/// Guardrails the AI agent must evaluate before any money-related action.
+model PolicyConfig {
+  id                     String   @id @default(cuid())
+  merchantId             String   @unique
+  merchant               Merchant @relation(fields: [merchantId], references: [id])
+
+  maxAiTransactionInr    Int      @default(10000)
+  maxAiDiscountPct       Int      @default(10)
+  maxCampaignDiscountPct Int      @default(15)
+  requireApprovalPayment Boolean  @default(true)
+  requireApprovalDiscountAbovePct Int @default(5)
+  allowedCategories      String   @default("Sports/Fitness")
+  maxDailyAiSpendInr     Int      @default(25000)
+  autoCampaignsRequireApproval Boolean @default(true)
+
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Product {
+  id              String   @id @default(cuid())
+  sku             String   @unique
+  name            String
+  category        String
+  priceInr        Int
+  stock           Int
+  sizes           String   // comma-separated, e.g. "7,8,9,10"
+  deliveryDays    String   // e.g. "2-3 days"
+  returnPolicy    String   @default("7 days")
+  aiTags          String   // comma-separated tags for AI discovery
+  description     String
+  imageEmoji      String   @default("👟")
+  createdAt       DateTime @default(now())
+
+  orderItems      OrderItem[]
+  cartItems       CartItem[]
+  fromAffinities  ProductAffinity[] @relation("FromProduct")
+  toAffinities    ProductAffinity[] @relation("ToProduct")
+}
+
+/// Precomputed "customers who bought X also bought Y" relationships,
+/// the data backbone of the cross-sell / upsell engine.
+model ProductAffinity {
+  id                    String  @id @default(cuid())
+  fromProductId         String
+  fromProduct           Product @relation("FromProduct", fields: [fromProductId], references: [id])
+  toProductId           String
+  toProduct             Product @relation("ToProduct", fields: [toProductId], references: [id])
+
+  attachRatePct         Int     // % of buyers of fromProduct who also buy toProduct
+  avgAdditionalRevenueInr Int
+  purchaseFrequency     Int     // co-occurrences observed in order history
+
+  @@unique([fromProductId, toProductId])
+}
+
+// ---------------------------------------------------------------------------
+// Customers & Orders
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  phone        String
+  segment      String   // e.g. "high-value", "repeat", "new"
+  totalOrders  Int      @default(0)
+  totalSpendInr Int     @default(0)
+  createdAt    DateTime @default(now())
+
+  orders       Order[]
+  carts        Cart[]
+}
+
+model Order {
+  id              String   @id @default(cuid())
+  idempotencyKey  String?  @unique
+  customerId      String
+  customer        Customer @relation(fields: [customerId], references: [id])
+
+  subtotalInr     Int
+  discountInr     Int      @default(0)
+  totalInr        Int
+  status          String   @default("CREATED") // CREATED, CONFIRMED, CANCELLED
+  aiAttributed    Boolean  @default(false)
+  aiOpportunityId String?
+  channel         String   @default("web") // web | ai_commerce
+  createdAt       DateTime @default(now())
+
+  items           OrderItem[]
+  payments        Payment[]
+}
+
+model OrderItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id])
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  quantity    Int      @default(1)
+  unitPriceInr Int
+  isAiCrossSell Boolean @default(false)
+}
+
+model Cart {
+  id          String   @id @default(cuid())
+  customerId  String?
+  customer    Customer? @relation(fields: [customerId], references: [id])
+  status      String   @default("ACTIVE") // ACTIVE, ABANDONED, RECOVERED, CONVERTED
+  source      String   @default("web") // web | ai_commerce
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  items       CartItem[]
+}
+
+model CartItem {
+  id          String  @id @default(cuid())
+  cartId      String
+  cart        Cart    @relation(fields: [cartId], references: [id])
+  productId   String
+  product     Product @relation(fields: [productId], references: [id])
+  quantity    Int     @default(1)
+  addedByAi   Boolean @default(false)
+}
+
+// ---------------------------------------------------------------------------
+// Payments (explicit state machine)
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id              String   @id @default(cuid())
+  idempotencyKey  String   @unique
+  orderId         String
+  order           Order    @relation(fields: [orderId], references: [id])
+  amountInr       Int
+  status          String   @default("CREATED")
+  // CREATED -> PENDING_APPROVAL -> APPROVED -> PAYMENT_INITIATED
+  //   -> PAYMENT_FAILED -> RETRY_PENDING -> PAYMENT_INITIATED -> PAID
+  //   (or -> CANCELLED at any pre-PAID state)
+  attemptNumber   Int      @default(1)
+  razorpayOrderId String?
+  razorpayPaymentId String?
+  mode            String   @default("SIMULATED") // SIMULATED | RAZORPAY_TEST
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Growth: opportunities & campaigns
+// ---------------------------------------------------------------------------
+
+model AiOpportunity {
+  id                  String   @id @default(cuid())
+  type                String   // CROSS_SELL, CART_RECOVERY, UPSELL_SEGMENT, INVENTORY_CAMPAIGN
+  title               String
+  segment             String
+  reasoning           String
+  productId           String?
+  relatedProductId    String?
+  currentPriceInr     Int?
+  suggestedOfferPct   Int?
+  expectedRevenueInr  Int
+  confidencePct       Int
+  status              String   @default("PENDING") // PENDING, APPROVED, REJECTED
+  createdAt           DateTime @default(now())
+  resolvedAt          DateTime?
+}
+
+model Campaign {
+  id                  String   @id @default(cuid())
+  name                String
+  goal                String
+  target              String
+  action              String
+  expectedRevenueInr  Int
+  discountCostInr     Int      @default(0)
+  status              String   @default("DRAFT") // DRAFT, PROPOSED, APPROVED, ACTIVE, COMPLETED, REJECTED
+  planJson            String?  // full orchestrator plan snapshot
+  createdAt           DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// AI audit trail (every tool call / decision, gated or not)
+// ---------------------------------------------------------------------------
+
+model AiAction {
+  id               String   @id @default(cuid())
+  timestamp        DateTime @default(now())
+  actor            String   // AI | MERCHANT | CUSTOMER | SYSTEM
+  action           String   // e.g. "search_products", "create_order", "request_payment_approval"
+  toolCategory     String   @default("READ") // READ | WRITE | MONEY
+  entityType       String?  // Product | Order | Payment | Campaign | Opportunity
+  entityId         String?
+  amountInr        Int?
+  reason           String?
+  confidencePct    Int?
+  expectedImpactInr Int?
+  policyResult     String   @default("N/A") // PASSED | BLOCKED | PENDING | N/A
+  policyDetail     String?
+  approvalRequired Boolean  @default(false)
+  approvalStatus   String   @default("NOT_REQUIRED") // NOT_REQUIRED | PENDING | APPROVED | REJECTED
+  outcome          String   @default("SUCCESS") // SUCCESS | FAILED | BLOCKED | PENDING
+  sessionId        String?  // links AI buyer simulator / checkout session events together
+}
+
+// ---------------------------------------------------------------------------
+// AI Buyer Simulator sessions (for the demo / AI Commerce flow)
+// ---------------------------------------------------------------------------
+
+model BuyerSession {
+  id          String   @id @default(cuid())
+  query       String
+  parsedJson  String?  // parsed intent (budget, size, usage, preference)
+  cartId      String?
+  status      String   @default("ACTIVE") // ACTIVE, CHECKED_OUT, ABANDONED
+  createdAt   DateTime @default(now())
+}
