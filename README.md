@@ -189,9 +189,11 @@ never silently become `PAID`).
 `RazorpayGateway` creates a real Razorpay test-mode Order via the Orders API;
 the client-side Razorpay Checkout widget collects the (test) card, and the
 result is verified server-side with an HMAC signature check (`verifyPayment`)
-— never trusted blindly. Using one of Razorpay's published test cards that
-always decline demonstrates the failure → retry flow against the real
-gateway, not a mock.
+— never trusted blindly.
+
+Note: a real gateway doesn't fail on its own the way a mock would. To see the
+failure → retry flow, pay with one of Razorpay's test cards that's documented
+to always get declined — a normal test card will simply succeed.
 
 ## Demo instructions
 
