@@ -44,6 +44,38 @@ interface Msg {
 let uid = 0;
 const nextId = () => `m${++uid}`;
 
+interface RazorpayCheckoutOptions {
+  key?: string;
+  amount: number;
+  currency: string;
+  name: string;
+  description?: string;
+  order_id: string;
+  handler: (response: { razorpay_payment_id: string; razorpay_order_id: string; razorpay_signature: string }) => void;
+  modal?: { ondismiss?: () => void };
+  theme?: { color?: string };
+}
+interface RazorpayCheckoutInstance {
+  open: () => void;
+  on: (event: "payment.failed", handler: (response: { error: { description: string } }) => void) => void;
+}
+declare global {
+  interface Window {
+    Razorpay?: new (options: RazorpayCheckoutOptions) => RazorpayCheckoutInstance;
+  }
+}
+
+function loadRazorpayScript(): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (window.Razorpay) return resolve(true);
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.body.appendChild(script);
+  });
+}
+
 export default function AiBuyerSimulatorPage() {
   return (
     <Suspense fallback={null}>
@@ -95,7 +127,7 @@ function AiBuyerSimulator() {
 
     if (data.crossSell) {
       setCrossSell(data.crossSell);
-      push("crosssell", data.crossSell);
+      push("crosssell", { ...data.crossSell, fromProductName: data.selected.product.name });
     } else {
       push("no-crosssell", { product: data.selected.product });
     }
@@ -145,15 +177,92 @@ function AiBuyerSimulator() {
       body: JSON.stringify({ orderId, sessionId }),
     });
     const data = await res.json();
+
+    if (data.ok && data.data?.mode === "RAZORPAY_TEST") {
+      // Order created with the real Razorpay API — payment itself hasn't
+      // happened yet. Open the Checkout widget and wait for its result
+      // instead of treating this response as final.
+      await openRazorpayCheckout(orderId, data.data);
+      return;
+    }
+
     const statusRes = await fetch(`/api/checkout/status?orderId=${orderId}`);
     const { order: fresh } = await statusRes.json();
-
     if (data.ok) {
       push("payment-success", fresh);
     } else {
       push("payment-failed", { reason: data.blockedReason, order: fresh });
     }
     setBusy(false);
+  }
+
+  async function finishRazorpayAttempt(orderId: string, verifyBody: Record<string, unknown>) {
+    const verifyRes = await fetch("/api/checkout/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId, ...verifyBody }),
+    });
+    const verifyData = await verifyRes.json();
+    const statusRes = await fetch(`/api/checkout/status?orderId=${orderId}`);
+    const { order: fresh } = await statusRes.json();
+    if (verifyData.ok) {
+      push("payment-success", fresh);
+    } else {
+      push("payment-failed", { reason: verifyData.blockedReason, order: fresh });
+    }
+    setBusy(false);
+  }
+
+  async function openRazorpayCheckout(
+    orderId: string,
+    data: { paymentId: string; gatewayOrderId: string; keyId?: string; amountInr: number }
+  ) {
+    const loaded = await loadRazorpayScript();
+    if (!loaded || !window.Razorpay) {
+      push("ai-text", "The Razorpay payment widget failed to load. Please check your connection and try again.");
+      setBusy(false);
+      return;
+    }
+
+    let settled = false;
+    const rzp = new window.Razorpay({
+      key: data.keyId,
+      amount: Math.round(data.amountInr * 100),
+      currency: "INR",
+      name: "StrideX Sports",
+      description: "MerchantOS order",
+      order_id: data.gatewayOrderId,
+      handler: (response) => {
+        settled = true;
+        finishRazorpayAttempt(orderId, {
+          localPaymentId: data.paymentId,
+          orderId: response.razorpay_order_id,
+          paymentId: response.razorpay_payment_id,
+          signature: response.razorpay_signature,
+        });
+      },
+      modal: {
+        ondismiss: () => {
+          if (settled) return;
+          settled = true;
+          finishRazorpayAttempt(orderId, {
+            localPaymentId: data.paymentId,
+            failed: true,
+            reason: "Customer closed the payment window before completing payment.",
+          });
+        },
+      },
+    });
+    rzp.on("payment.failed", (response) => {
+      if (settled) return;
+      settled = true;
+      finishRazorpayAttempt(orderId, {
+        localPaymentId: data.paymentId,
+        failed: true,
+        reason: response.error?.description ?? "Payment was declined.",
+      });
+    });
+    rzp.open();
   }
 
   function reset() {
@@ -288,11 +397,12 @@ function MessageRenderer({
       );
     }
     case "crosssell": {
-      const cs = msg.payload as { product: Product; attachRatePct: number; avgAdditionalRevenueInr: number };
+      const cs = msg.payload as { product: Product; attachRatePct: number; avgAdditionalRevenueInr: number; fromProductName: string };
       return (
         <AiCard>
           <div className="text-sm text-slate-700">
-            Customers purchasing this shoe often add <span className="font-medium">{cs.product.name}</span>. It&apos;s{" "}
+            Customers purchasing <span className="font-medium">{cs.fromProductName}</span> often add{" "}
+            <span className="font-medium">{cs.product.name}</span>. It&apos;s{" "}
             {formatInr(cs.product.priceInr)} today. ({cs.attachRatePct}% attach rate)
           </div>
           <div className="mt-3 flex gap-2">

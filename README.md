@@ -56,8 +56,7 @@ One intelligence layer, two surfaces:
                      for every MONEY tool call)
                                |
                                v
-                     RAZORPAY (test mode) /
-                   SIMULATED payment adapter
+                        RAZORPAY (test mode)
                                |
                                v
                          AUDIT TRAIL
@@ -67,9 +66,9 @@ One intelligence layer, two surfaces:
 ```
 
 ```
-   Human Buyer ─┐                                  ┌─ Razorpay
-                ├──▶  MerchantOS Agent  ─────────▶──┤   (test mode)
-   AI Buyer ────┘                                  └─ Simulated gateway
+   Human Buyer ─┐
+                ├──▶  MerchantOS Agent  ─────────▶──  Razorpay (test mode)
+   AI Buyer ────┘
 ```
 
 ## Architecture
@@ -85,10 +84,9 @@ Full-stack Next.js 16 (App Router) + TypeScript monolith:
   only cross-compatible types.
 - **AI agent layer**: `src/lib/agent/` — tool functions, deterministic intent
   parsing/ranking, and reasoning. See [AI Agent](#ai-agent) below.
-- **Payments**: `src/lib/payments/` — a `PaymentGateway` interface with two
-  implementations, `RazorpayGateway` (real test-mode Orders API) and
-  `SimulatedGateway` (deterministic demo adapter). Selected automatically based
-  on whether `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` are set.
+- **Payments**: `src/lib/payments/` — `RazorpayGateway` integrates the real
+  Razorpay **test-mode** Orders API: order creation, the client-side Checkout
+  widget, and server-side HMAC signature verification (`verifyPayment`).
 - **Policy engine**: `src/lib/policy.ts` — the single choke point every
   MONEY-category tool call passes through.
 - **Audit log**: `src/lib/audit.ts` — every tool call is written to the
@@ -106,8 +104,8 @@ src/lib/seedData.ts          The 50-SKU catalog + name lists + campaign template
 src/lib/db.ts                Prisma client singleton
 src/lib/policy.ts            Guardrail evaluation (checkPolicy)
 src/lib/audit.ts             Audit logging + Trust Center stats
-src/lib/payments/            PaymentGateway interface, Razorpay + Simulated adapters,
-                             explicit payment state machine
+src/lib/payments/            Razorpay Test Mode integration + explicit payment
+                             state machine
 src/lib/agent/
   tools.ts                   The agent's tool surface (READ/WRITE/MONEY)
   intent.ts                  Deterministic buyer-query parser
@@ -182,24 +180,18 @@ payment initiated, fully logged.
 
 ## Payments — Razorpay integration
 
-`src/lib/payments/` defines a `PaymentGateway` interface with an explicit state
-machine (`CREATED → PENDING_APPROVAL → APPROVED → PAYMENT_INITIATED → PAID`,
-with `PAYMENT_FAILED → RETRY_PENDING → PAYMENT_INITIATED` as the only path back
-from a failure — a failed payment can never silently become `PAID`).
+`src/lib/payments/` integrates the real Razorpay **Test Mode** Orders API
+through an explicit state machine (`CREATED → PENDING_APPROVAL → APPROVED →
+PAYMENT_INITIATED → PAID`, with `PAYMENT_FAILED → RETRY_PENDING →
+PAYMENT_INITIATED` as the only path back from a failure — a failed payment can
+never silently become `PAID`).
 
-- **`RazorpayGateway`** (real): used automatically when `RAZORPAY_KEY_ID` and
-  `RAZORPAY_KEY_SECRET` are set. Creates a real Razorpay **test-mode** Order via
-  the Orders API; payment capture happens client-side via Razorpay Checkout and
-  is verified server-side with an HMAC signature check (`verifyPayment`) — never
-  trusted blindly.
-- **`SimulatedGateway`** (demo): used when no keys are configured. Never
-  contacts a payment network. Deterministic: the **first** attempt on every
-  payment fails (`DEMO_FORCE_FIRST_ATTEMPT_FAILURE=true`, the default), the
-  retry succeeds — this is what drives the mandatory failure/recovery demo
-  reliably, every run.
-
-Both modes are clearly labeled in the UI (AI Commerce readiness card, Settings
-page) — a simulated payment is never presented as a real one.
+`RazorpayGateway` creates a real Razorpay test-mode Order via the Orders API;
+the client-side Razorpay Checkout widget collects the (test) card, and the
+result is verified server-side with an HMAC signature check (`verifyPayment`)
+— never trusted blindly. Using one of Razorpay's published test cards that
+always decline demonstrates the failure → retry flow against the real
+gateway, not a mock.
 
 ## Demo instructions
 
@@ -222,9 +214,11 @@ Suggested walkthrough (5–7 min):
    Filtering → Ranking, select **StrideX ProRun X1**, recommend **Performance
    Socks** (72% attach rate), click **Add them**, then **Approve & Pay** on the
    policy-gated order summary.
-4. **Payment fails** on the first attempt (by design) — cart preserved, no
-   duplicate charge, no silent retry. Click **Retry Payment** → succeeds →
-   **Order confirmed** with a Payment #1 FAILED / Payment #2 PAID timeline.
+4. **Payment fails** — pay with one of Razorpay's test cards that always
+   declines (or just close the Checkout popup) to see: cart preserved, no
+   duplicate charge, no silent retry. Click **Retry Payment**, complete it
+   with a valid test card → **Order confirmed** with a Payment #1 FAILED /
+   Payment #2 PAID timeline.
 5. **AI Activity → Audit Trail** — every step above, logged with timestamps.
 6. **AI Activity → Trust Center** — Explainable/Bounded/Gated pillars, today's
    action counts, the ₹18,999 blocked-transaction example.
@@ -251,7 +245,7 @@ See `.env.example`. Nothing is hard-coded; secrets are never sent to the client.
 | Variable | Required? | Purpose |
 |---|---|---|
 | `DATABASE_URL` | Yes | Prisma datasource. Defaults to local SQLite (`file:./dev.db`). |
-| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | No | Real Razorpay **test-mode** keys. Omit to run on the simulated gateway. |
+| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | Yes | Real Razorpay **test-mode** keys — generate free ones from the Razorpay Dashboard (Test Mode → Settings → API Keys). |
 | `ANTHROPIC_API_KEY` | No | Reserved extension point (see AI Agent section). Unused by the core deterministic flows. |
 | `DEMO_FORCE_FIRST_ATTEMPT_FAILURE` | No (default `true`) | Keeps the failure/retry demo deterministic. Set to `false` for an always-succeeds gateway. |
 
@@ -259,9 +253,6 @@ See `.env.example`. Nothing is hard-coded; secrets are never sent to the client.
 
 - SQLite is used for zero-config local demo purposes; the schema is Postgres-portable
   but hasn't been run against Postgres in this environment.
-- Without real Razorpay keys, payments run on the deterministic simulated
-  gateway — the Orders-API integration code path (`RazorpayGateway`) is real
-  and wired, but exercising it end-to-end requires your own test-mode keys.
 - Buyer-intent parsing is regex/rule-based, not a live LLM call (see rationale
   above) — unusual free-text phrasing may not parse every field, though the
   search step degrades gracefully (widens the filter rather than failing).
